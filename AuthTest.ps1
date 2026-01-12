@@ -29,7 +29,7 @@ Write-Host "⚠️  Note: You will need Global Administrator or Privileged Role 
 Write-Host ""
 Write-Host "Checking Azure login status..."
 
-if ($IsCloudShell -eq "False") {
+if (-not $IsCloudShell) {
 
     try {
         $account = az account show --query "{id:id, tenantId:tenantId, name:tenantDisplayName, user:user.name}" -o json | ConvertFrom-Json
@@ -66,4 +66,5 @@ Write-Host "✓ Authenticated successfully" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Tenant: " -NoNewline; Write-Host $TENANT_NAME -ForegroundColor Cyan
 Write-Host "  Tenant ID: " -NoNewline; Write-Host $TENANT_ID -ForegroundColor Cyan
+
 Write-Host ""
