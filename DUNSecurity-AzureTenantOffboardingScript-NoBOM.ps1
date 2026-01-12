@@ -8,27 +8,28 @@
   - Subscription-scope Azure RBAC role assignments
 
 .VERSION
-    Version: 1.0.0
-    Last Updated: 2026-01-26
+    Version: 1.0.2
+    Last Updated: 2026-01-12
     Note: Future version to include artefact removal for Network Flow Logs and Sentinel Log Analytics Workspace artefacts
+    Note: Bug fix added for more rebust clean up on previously incomplete runs
 
 .DESCRIPTION
   1) Always runs a DRY RUN first and shows what WOULD be removed.
   2) Prompts you to confirm expectation before deleting anything.
   3) If confirmed, removes artifacts in this order:
         - Client secret(s) on the app registration (displayName == "DUN-SSO-Secret")
-        - Service principal object
-        - Microsoft Graph application permissions (requested requiredResourceAccess; appRoleAssignments skipped if SP deleted)
-        - Azure Service Management delegated consent grant + requested delegated permission
-        - Subscription-scope Azure RBAC role assignments
+        - Service principal object (if present)
+        - Microsoft Graph application permissions (requested requiredResourceAccess; appRoleAssignments skipped if SP missing/deleted)
+        - Azure Service Management delegated consent grant + requested delegated permission (grant delete is idempotent; 404 ignored)
+        - Subscription-scope Azure RBAC role assignments (requires principalId; supports SP override)
         - Exposed API configuration (remove oauth2PermissionScopes value == "user_impersonation"; remove identifierUri api://<APP_ID>)
         - App registration object
-
 
 .NOTES
   - No parameters
   - No intermediate/temp files
   - No exit/termination (Cloud Shell / IDE friendly)
+  - If the Service Principal has already been deleted, you can still clean up RBAC / delegated grants by setting $SP_OBJECT_ID_OVERRIDE.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +41,11 @@ $ErrorActionPreference = "Stop"
 # Application (client) ID / App ID (GUID) format: 32 hexadecimal characters (0-9, a-f) split into 5 groups with hyphens: 8-4-4-4-12
 # (e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx where each x is 0-9 or a-f)
 $APP_ID = ""
+
+# OPTIONAL: If the Service Principal (Enterprise App) has already been deleted
+# but you still need to remove RBAC role assignments / delegated consent grants,
+# set the former SP objectId (principalId) here (GUID format: 8-4-4-4-12 hex characters).
+$SP_OBJECT_ID_OVERRIDE = ""
 
 # Prefix used to find the App Registration (displayName starts with)
 $APP_NAME_PREFIX = "DUN Security -"
@@ -59,11 +65,25 @@ $PSDefaultParameterValues['Format-Table:AutoSize'] = $true   # optional
 function Run-Az {
   param([Parameter(Mandatory=$true)][string[]]$Args)
 
-  $prev = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
-  $out = & az @Args 2>&1
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = "SilentlyContinue"
+
+  # Prevent native stderr -> PowerShell error records (PowerShell 7+)
+  $hadNativePref = $false
+  $prevNativePref = $null
+  try {
+    if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+      $hadNativePref = $true
+      $prevNativePref = $global:PSNativeCommandUseErrorActionPreference
+      $global:PSNativeCommandUseErrorActionPreference = $false
+    }
+  } catch { }
+
+  $out  = & az @Args 2>&1
   $code = $LASTEXITCODE
-  $ErrorActionPreference = $prev
+
+  if ($hadNativePref) { $global:PSNativeCommandUseErrorActionPreference = $prevNativePref }
+  $ErrorActionPreference = $prevEap
 
   [pscustomobject]@{
     ExitCode = $code
@@ -72,10 +92,14 @@ function Run-Az {
 }
 
 function Get-GraphToken {
-  $t = (Run-Az @("account","get-access-token","--resource-type","ms-graph","--query","accessToken","-o","tsv")).Output
+  $res = Run-Az @("account","get-access-token","--resource-type","ms-graph","--query","accessToken","-o","tsv")
+  $t = if ($res.ExitCode -eq 0) { $res.Output } else { $null }
+
   if (-not $t) {
-    $t = (Run-Az @("account","get-access-token","--resource","https://graph.microsoft.com/","--query","accessToken","-o","tsv")).Output
+    $res2 = Run-Az @("account","get-access-token","--resource","https://graph.microsoft.com/","--query","accessToken","-o","tsv")
+    $t = if ($res2.ExitCode -eq 0) { $res2.Output } else { $null }
   }
+
   if (-not $t) { throw "Failed to acquire Microsoft Graph access token from Azure CLI." }
   $t.Trim()
 }
@@ -121,6 +145,7 @@ try {
   # Auto-discover APP_ID (appId/clientId) from App Registration displayName prefix
   # =====================================================================
   $appObjectId = $null
+  $AppDisplayName = $null
 
   if ([string]::IsNullOrWhiteSpace($APP_ID)) {
     Info ("APP_ID not set. Searching App Registrations with displayName prefix: '{0}'..." -f $APP_NAME_PREFIX)
@@ -140,13 +165,18 @@ try {
     }
     catch {
       Warn "Graph search for applications failed; falling back to Azure CLI listing (may be slower)."
-      $appsJson = (Run-Az @(
+
+      $appsRes = Run-Az @(
         "ad","app","list","--all",
         "--query","[?starts_with(displayName, '$APP_NAME_PREFIX')].{displayName:displayName,appId:appId,id:id}",
         "-o","json","--only-show-errors"
-      )).Output
+      )
 
-      if ($appsJson) { $apps = @($appsJson | ConvertFrom-Json) }
+      if ($appsRes.ExitCode -eq 0 -and $appsRes.Output) {
+        $apps = @($appsRes.Output | ConvertFrom-Json)
+      } else {
+        $apps = @()
+      }
     }
 
     if (-not $apps -or $apps.Count -eq 0) {
@@ -158,7 +188,8 @@ try {
     if ($apps.Count -eq 1) {
       $APP_ID = $apps[0].appId
       $appObjectId = $apps[0].id
-      Good ("Auto-selected app: {0} | appId: {1} | objectId: {2}" -f $apps[0].displayName, $APP_ID, $appObjectId)
+      $AppDisplayName = $apps[0].displayName
+      Good ("Auto-selected app: {0} | appId: {1} | objectId: {2}" -f $AppDisplayName, $APP_ID, $appObjectId)
     }
     else {
       Warn ("Found {0} matching App Registrations. Please select one:" -f $apps.Count)
@@ -187,10 +218,20 @@ try {
       $picked = $choices[[int]$sel - 1]
       $APP_ID = $picked.AppId
       $appObjectId = $picked.ObjectId
-      Good ("Selected app: {0} | appId: {1} | objectId: {2}" -f $picked.DisplayName, $APP_ID, $appObjectId)
+      $AppDisplayName = $picked.DisplayName
+      Good ("Selected app: {0} | appId: {1} | objectId: {2}" -f $AppDisplayName, $APP_ID, $appObjectId)
     }
   } else {
     Info ("APP_ID provided: {0}" -f $APP_ID)
+
+    # Try to resolve app displayName + objectId (helps later steps)
+    try {
+      $appLookup = Invoke-Graph -Method GET -Uri ("https://graph.microsoft.com/v1.0/applications?`$select=id,appId,displayName&`$filter=appId eq '{0}'&`$top=1" -f $APP_ID)
+      if ($appLookup.value -and $appLookup.value.Count -gt 0) {
+        $appObjectId = $appLookup.value[0].id
+        $AppDisplayName = $appLookup.value[0].displayName
+      }
+    } catch { }
   }
 
   if ([string]::IsNullOrWhiteSpace($APP_ID)) {
@@ -198,46 +239,72 @@ try {
     return
   }
 
-  Info "Resolving service principal for appId: $APP_ID"
-
-  $spJson = (Run-Az @("ad","sp","show","--id",$APP_ID,"--query","{displayName:displayName,appId:appId,id:id}","-o","json","--only-show-errors")).Output
-  if (-not $spJson) {
-    Warn "Service principal not found for this appId."
-    Warn "If the SP doesn't exist, SP/RBAC removal is not relevant."
-    Warn "Nothing to do."
-    return
+  if ([string]::IsNullOrWhiteSpace($AppDisplayName)) {
+    $AppDisplayName = "DUN Security app (displayName unavailable)"
   }
 
-  $sp = $spJson | ConvertFrom-Json
-  $spObjectId = $sp.id
-  $spName = $sp.displayName
+  # =====================================================================
+  # Resolve Service Principal (optional) - DO NOT return if missing
+  # =====================================================================
+  Info "Resolving service principal for appId: $APP_ID"
 
-  Good ("Target SP: {0} | appId: {1} | objectId: {2}" -f $spName, $sp.appId, $sp.id)
+  $spObjectId = $null
+  $spName = $null
+  $spPresent = $false
+
+  $spRes = Run-Az @(
+    "ad","sp","show","--id",$APP_ID,
+    "--query","{displayName:displayName,appId:appId,id:id}",
+    "-o","json","--only-show-errors"
+  )
+
+  if ($spRes.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($spRes.Output)) {
+    $sp = $spRes.Output | ConvertFrom-Json
+    $spObjectId = $sp.id
+    $spName = $sp.displayName
+    $spPresent = $true
+    Good ("Target SP: {0} | appId: {1} | objectId: {2}" -f $spName, $sp.appId, $sp.id)
+  }
+  elseif (-not [string]::IsNullOrWhiteSpace($SP_OBJECT_ID_OVERRIDE)) {
+    $spObjectId = $SP_OBJECT_ID_OVERRIDE.Trim()
+    $spName = "$AppDisplayName (SP not found; using override principalId)"
+    $spPresent = $false
+    Warn "Service principal not found for this appId, but SP_OBJECT_ID_OVERRIDE is set."
+    Warn "Will attempt RBAC/grant cleanup using principalId: $spObjectId"
+  }
+  else {
+    $spObjectId = $null
+    $spName = "$AppDisplayName (service principal not found)"
+    $spPresent = $false
+    Warn "Service principal not found for this appId."
+    Warn "Continuing with APP-ONLY cleanup (app registration / secrets / requiredResourceAccess / exposed API / app deletion)."
+    Warn "RBAC + delegated consent grant cleanup will be skipped because principalId is unknown."
+  }
 
   # Resolve Application OBJECT id (needed for secret removal / exposed API checks)
   if (-not $appObjectId) {
-    $appObjectIdOut = (Run-Az @("ad","app","show","--id",$APP_ID,"--query","id","-o","tsv","--only-show-errors")).Output
-    if ($appObjectIdOut) { $appObjectId = $appObjectIdOut.Trim() }
+    $appIdRes = Run-Az @("ad","app","show","--id",$APP_ID,"--query","id","-o","tsv","--only-show-errors")
+    if ($appIdRes.ExitCode -eq 0 -and $appIdRes.Output) { $appObjectId = $appIdRes.Output.Trim() }
   }
 
   Warn "This script will FIRST carry out a DRY RUN and show you exactly what it intends to delete."
   Warn "Review the DRY RUN output carefully (secrets, service principal, permissions/consent, RBAC assignments, exposed API settings, and the app registration) before proceeding."
-  Warn "If you confirm, deletions will be attempted in this order: client secrets -> service principal -> Graph permissions -> delegated consent/permission -> RBAC role assignments -> exposed API settings -> app registration."
+  Warn "If you confirm, deletions will be attempted in this order: client secrets -> service principal (if present) -> Graph permissions -> delegated consent/permission -> RBAC role assignments -> exposed API settings -> app registration."
   Info ""
 
   # =====================================================================
-  # # Exposed API configuration targets (identifierUri + oauth2PermissionScopes)
+  # Exposed API configuration targets (identifierUri + oauth2PermissionScopes)
   # =====================================================================
   $ExposeApiIdentifierUri = "api://$APP_ID"
   $ExposeApiScopeValue    = "user_impersonation"
 
   # =====================================================================
-  # # Client secret(s) to remove (passwordCredentials with displayName == "DUN-SSO-Secret")
+  # Client secret(s) to remove (passwordCredentials with displayName == "DUN-SSO-Secret")
   # =====================================================================
   $SecretDisplayName = "DUN-SSO-Secret"
 
   # =====================================================================
-  # # Microsoft Graph application permissions to remove (app roles requested/consented)
+  # Microsoft Graph application permissions to remove (app roles requested/consented)
   # =====================================================================
   $MS_GRAPH_APPID = "00000003-0000-0000-c000-000000000000"
 
@@ -252,34 +319,32 @@ try {
     "38d9df27-64da-44fd-b7c5-a6fbac20248f" # UserAuthenticationMethod.Read.All
   ) | ForEach-Object { $_.ToLower() } | Select-Object -Unique
 
-  $graphSpId = (Run-Az @("ad","sp","show","--id",$MS_GRAPH_APPID,"--query","id","-o","tsv","--only-show-errors")).Output
-  if (-not $graphSpId) { throw "Could not resolve Microsoft Graph service principal object id." }
-  $graphSpId = $graphSpId.Trim()
+  $graphSpRes = Run-Az @("ad","sp","show","--id",$MS_GRAPH_APPID,"--query","id","-o","tsv","--only-show-errors")
+  if (-not ($graphSpRes.ExitCode -eq 0 -and $graphSpRes.Output)) { throw "Could not resolve Microsoft Graph service principal object id." }
+  $graphSpId = $graphSpRes.Output.Trim()
 
   # =====================================================================
-  # Targets
+  # Targets - Azure Service Management API delegated scope
   # =====================================================================
   $AZURE_MGMT_APPID = "797f4846-ba00-4fd7-ba43-dac1f8f63013"
   $scopeValue = "user_impersonation"
 
-  $resourceSpId = (Run-Az @("ad","sp","show","--id",$AZURE_MGMT_APPID,"--query","id","-o","tsv","--only-show-errors")).Output
-  if (-not $resourceSpId) { throw "Could not resolve Azure Service Management API service principal ($AZURE_MGMT_APPID)." }
-  $resourceSpId = $resourceSpId.Trim()
+  $resourceSpRes = Run-Az @("ad","sp","show","--id",$AZURE_MGMT_APPID,"--query","id","-o","tsv","--only-show-errors")
+  if (-not ($resourceSpRes.ExitCode -eq 0 -and $resourceSpRes.Output)) { throw "Could not resolve Azure Service Management API service principal ($AZURE_MGMT_APPID)." }
+  $resourceSpId = $resourceSpRes.Output.Trim()
 
-  $userImpersonationId = (Run-Az @("ad","sp","show","--id",$AZURE_MGMT_APPID,"--query","oauth2PermissionScopes[?value=='$scopeValue'].id | [0]","-o","tsv","--only-show-errors")).Output
+  $userImpRes = Run-Az @("ad","sp","show","--id",$AZURE_MGMT_APPID,"--query","oauth2PermissionScopes[?value=='$scopeValue'].id | [0]","-o","tsv","--only-show-errors")
+  $userImpersonationId = if ($userImpRes.ExitCode -eq 0) { $userImpRes.Output } else { $null }
+
   if (-not $userImpersonationId) {
-    $userImpersonationId = (Run-Az @("ad","sp","show","--id",$AZURE_MGMT_APPID,"--query","oauth2Permissions[?value=='$scopeValue'].id | [0]","-o","tsv","--only-show-errors")).Output
+    $userImpRes2 = Run-Az @("ad","sp","show","--id",$AZURE_MGMT_APPID,"--query","oauth2Permissions[?value=='$scopeValue'].id | [0]","-o","tsv","--only-show-errors")
+    $userImpersonationId = if ($userImpRes2.ExitCode -eq 0) { $userImpRes2.Output } else { $null }
   }
   if (-not $userImpersonationId) { throw "Could not resolve scope id for '$scopeValue' on Azure Service Management API." }
   $userImpersonationId = $userImpersonationId.Trim()
 
   # =====================================================================
   # DRY RUN - Discover current App Registration state
-  #   - Read the application object (Graph) so we can determine:
-  #       * Whether the app exists (for later app deletion)
-  #       * Which client secrets match our displayName filter (for later secret removal)
-  #       * Whether the Expose API identifierUri is present (for later removal)
-  #       * Which Expose API scopes match user_impersonation (for later removal)
   # =====================================================================
   $appFull = $null
   $SecretsToRemove = @()
@@ -287,7 +352,7 @@ try {
   $ExposeApiIdentifierPresent = $false
   $AppPresent = $false
 
-  Info ("DRY RUN: discovering application, exposed API settings, and client secrets for {0}..." -f $spName)
+  Info ("DRY RUN: discovering application, exposed API settings, and client secrets for {0}..." -f $AppDisplayName)
 
   if ($appObjectId) {
     $AppPresent = $true
@@ -305,7 +370,7 @@ try {
       $ExposeApiScopesToRemove = @($appFull.api.oauth2PermissionScopes | Where-Object { $_.value -eq $ExposeApiScopeValue })
     }
   } else {
-    Warn "Could not resolve application object id. App registration removal (Step 4/4b) and secret removal (Step 5b) will be skipped."
+    Warn "Could not resolve application object id. App registration removal and secret removal will be skipped."
   }
 
   Info ""
@@ -346,8 +411,8 @@ try {
   $step5Findings = @(
     [pscustomobject]@{
       Item    = "Service principal object"
-      Present = "Yes"
-      Details = ("Will delete service principal: {0} (objectId {1})" -f $spName, $spObjectId)
+      Present = $(if ($spPresent) { "Yes" } else { "No" })
+      Details = $(if ($spPresent) { ("Will delete service principal: {0} (objectId {1})" -f $spName, $spObjectId) } else { "Not present / already deleted. (RBAC/grants only possible if override principalId was provided.)" })
     }
     [pscustomobject]@{
       Item    = "Client secret(s) (passwordCredentials)"
@@ -368,19 +433,19 @@ try {
       Format-Table -AutoSize
   }
 
-# =====================================================================
-#   DRY RUN - Graph permission cleanup discovery
-#   - Finds requested Microsoft Graph application roles on the app registration (requiredResourceAccess)
-#   - Finds admin-consented Microsoft Graph app role assignments on the service principal (appRoleAssignments)
-# =====================================================================
+  # =====================================================================
+  # DRY RUN - Graph permission cleanup discovery
+  # =====================================================================
   Info ""
-  Info ("DRY RUN: discovering Microsoft Graph application permissions and consent artifacts for {0}..." -f $spName)
+  Info ("DRY RUN: discovering Microsoft Graph application permissions and consent artifacts for {0}..." -f $AppDisplayName)
 
-  $requestedGraphIdsOut = (Run-Az @(
+  $requestedGraphIdsOut = $null
+  $reqGraphRes = Run-Az @(
     "ad","app","show","--id",$APP_ID,
     "--query","requiredResourceAccess[?resourceAppId=='$MS_GRAPH_APPID'].resourceAccess[?type=='Role'].id",
     "-o","tsv","--only-show-errors"
-  )).Output
+  )
+  if ($reqGraphRes.ExitCode -eq 0) { $requestedGraphIdsOut = $reqGraphRes.Output }
 
   $requestedGraphIds = @()
   if ($requestedGraphIdsOut) {
@@ -394,21 +459,27 @@ try {
   $graphAssignmentsToRemoveCount = 0
   $matchingGraphAssignments = @()
 
-  try {
-    $graphAssignUri = ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignments?`$filter=resourceId eq {1}&`$select=id,appRoleId" -f $spObjectId, $graphSpId)
-    $graphAssignments = Invoke-Graph -Method GET -Uri $graphAssignUri
+  if ($spPresent -and $spObjectId) {
+    try {
+      $graphAssignUri = ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignments?`$filter=resourceId eq {1}&`$select=id,appRoleId" -f $spObjectId, $graphSpId)
+      $graphAssignments = Invoke-Graph -Method GET -Uri $graphAssignUri
 
-    if ($graphAssignments.value) {
-      $matchingGraphAssignments = @(
-        $graphAssignments.value | Where-Object {
-          $rid = ($_.appRoleId.ToString()).ToLower()
-          $GraphRequiredRoleIds -contains $rid
-        }
-      )
+      if ($graphAssignments.value) {
+        $matchingGraphAssignments = @(
+          $graphAssignments.value | Where-Object {
+            $rid = ($_.appRoleId.ToString()).ToLower()
+            $GraphRequiredRoleIds -contains $rid
+          }
+        )
+      }
+      $graphAssignmentsToRemoveCount = $matchingGraphAssignments.Count
+    } catch {
+      Warn "Could not enumerate Graph appRoleAssignments for DRY RUN (may require additional Graph permissions)."
+      $graphAssignmentsToRemoveCount = 0
+      $matchingGraphAssignments = @()
     }
-    $graphAssignmentsToRemoveCount = $matchingGraphAssignments.Count
-  } catch {
-    Warn "Could not enumerate Graph appRoleAssignments for DRY RUN (may require additional Graph permissions)."
+  } else {
+    Info "Skipping Graph appRoleAssignments discovery (service principal not present)."
     $graphAssignmentsToRemoveCount = 0
     $matchingGraphAssignments = @()
   }
@@ -422,7 +493,9 @@ try {
     [pscustomobject]@{
       Item    = "Admin-consented Graph app roles (appRoleAssignments)"
       Present = $(if ($graphAssignmentsToRemoveCount -gt 0) { "Yes" } else { "No" })
-      Details = $(if ($graphAssignmentsToRemoveCount -gt 0) { "Found $graphAssignmentsToRemoveCount matching appRoleAssignment(s) on the client service principal." } else { "No matching appRoleAssignments found (or could not enumerate)." })
+      Details = $(if (-not $spPresent) { "Skipped (service principal not present)." }
+                 elseif ($graphAssignmentsToRemoveCount -gt 0) { "Found $graphAssignmentsToRemoveCount matching appRoleAssignment(s) on the client service principal." }
+                 else { "No matching appRoleAssignments found (or could not enumerate)." })
     }
   )
 
@@ -430,33 +503,46 @@ try {
   Info "DRY RUN RESULTS (Microsoft Graph permissions + consent artifacts):"
   $step6Findings | Format-Table -AutoSize
 
-# =====================================================================
-# DRY RUN - Step 6b (Azure Mgmt delegated consent + requested perm)
-# =====================================================================
+  # =====================================================================
+  # DRY RUN - Step 6b (Azure Mgmt delegated consent + requested perm)
+  # =====================================================================
   Info ""
-  Info ("DRY RUN: discovering delegated consent grants and requested delegated permissions for {0}..." -f $spName)
-
-  $filter = [uri]::EscapeDataString("clientId eq '$spObjectId' and resourceId eq '$resourceSpId'")
-  $grants = Invoke-Graph -Method GET -Uri ("https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$filter")
+  Info ("DRY RUN: discovering delegated consent grants and requested delegated permissions for {0}..." -f $AppDisplayName)
 
   $matchingGrants = @()
-  if ($grants.value) {
-    $matchingGrants = @($grants.value | Where-Object {
-      $_.consentType -eq "AllPrincipals" -and (" $($_.scope) " -like "* $scopeValue *")
-    })
+  $grantPresent = $false
+
+  if ($spObjectId) {
+    try {
+      $filter = [uri]::EscapeDataString("clientId eq '$spObjectId' and resourceId eq '$resourceSpId'")
+      $grants = Invoke-Graph -Method GET -Uri ("https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$filter")
+
+      if ($grants.value) {
+        $matchingGrants = @($grants.value | Where-Object {
+          $_.consentType -eq "AllPrincipals" -and (" $($_.scope) " -like "* $scopeValue *")
+        })
+      }
+
+      $grantPresent = ($matchingGrants.Count -gt 0)
+    }
+    catch {
+      Warn "Could not query oauth2PermissionGrants for DRY RUN (may require additional permissions)."
+      $matchingGrants = @()
+      $grantPresent = $false
+    }
+  } else {
+    Info "Skipping delegated consent grant discovery (principalId unknown)."
   }
 
-  $grantPresent = ($matchingGrants.Count -gt 0)
-
-  $req6b = (Run-Az @(
+  $req6bRes = Run-Az @(
     "ad","app","show","--id",$APP_ID,
     "--query","requiredResourceAccess[?resourceAppId=='$AZURE_MGMT_APPID'].resourceAccess[]",
     "-o","json","--only-show-errors"
-  )).Output
+  )
 
   $requestedPresent = $false
-  if ($req6b) {
-    $ra6b = @($req6b | ConvertFrom-Json)
+  if ($req6bRes.ExitCode -eq 0 -and $req6bRes.Output) {
+    $ra6b = @($req6bRes.Output | ConvertFrom-Json)
     $requestedPresent = @($ra6b | Where-Object { $_.type -eq "Scope" -and $_.id -eq $userImpersonationId }).Count -gt 0
   }
 
@@ -464,7 +550,9 @@ try {
     [pscustomobject]@{
       Item    = "Delegated consent grant (AllPrincipals)"
       Present = $(if ($grantPresent) { "Yes" } else { "No" })
-      Details = $(if ($grantPresent) { "Found $($matchingGrants.Count) grant(s) for '$scopeValue' to Windows Azure Service Management API." } else { "No matching oauth2PermissionGrants found." })
+      Details = $(if (-not $spObjectId) { "Skipped (principalId unknown)." }
+                 elseif ($grantPresent) { "Found $($matchingGrants.Count) grant(s) for '$scopeValue' to Windows Azure Service Management API." }
+                 else { "No matching oauth2PermissionGrants found." })
     }
     [pscustomobject]@{
       Item    = "Requested delegated permission (requiredResourceAccess)"
@@ -482,8 +570,12 @@ try {
   # =====================================================================
   Info ""
   Info "Discovering enabled subscriptions..."
-  $subsJson = (Run-Az @("account","list","--query","[?state=='Enabled'].{id:id,name:name}","-o","json","--only-show-errors")).Output
-  $SUBSCRIPTIONS = if ($subsJson) { $subsJson | ConvertFrom-Json } else { @() }
+  $subsRes = Run-Az @("account","list","--query","[?state=='Enabled'].{id:id,name:name}","-o","json","--only-show-errors")
+
+  $SUBSCRIPTIONS = @()
+  if ($subsRes.ExitCode -eq 0 -and $subsRes.Output) {
+    $SUBSCRIPTIONS = @($subsRes.Output | ConvertFrom-Json)
+  }
 
   if (-not $SUBSCRIPTIONS -or $SUBSCRIPTIONS.Count -eq 0) {
     Warn "No enabled subscriptions found. RBAC removal will be skipped."
@@ -493,12 +585,9 @@ try {
     foreach ($s in $SUBSCRIPTIONS) { Info (" - {0} ({1})" -f $s.name, $s.id) }
   }
 
-# =====================================================================
-# DRY RUN - Azure RBAC discovery (subscription-scope role assignments)
-#   - Enumerates enabled subscriptions
-#   - Checks for role assignments on each subscription scope for the target principalId
-#   - Outputs counts by subscription + role to show exactly what would be deleted
-# =====================================================================
+  # =====================================================================
+  # DRY RUN - Azure RBAC discovery (subscription-scope role assignments)
+  # =====================================================================
   $RBAC_ROLES = @(
     "Reader",
     "Security Reader",
@@ -508,49 +597,57 @@ try {
     "Storage Account Contributor"
   )
 
-  Info ""
-  Info ("DRY RUN: scanning Azure subscriptions for RBAC role assignments linked to {0}..." -f $spName)
-
   $dryRunFindings = New-Object System.Collections.Generic.List[psobject]
+  $rbacTotal = 0
 
-  foreach ($sub in $SUBSCRIPTIONS) {
-    $subId = $sub.id
-    $subName = $sub.name
-    $scope = "/subscriptions/$subId"
+  Info ""
+  if (-not $spObjectId) {
+    Info "DRY RUN: skipping RBAC scan (principalId unknown)."
+  } elseif (-not $SUBSCRIPTIONS -or $SUBSCRIPTIONS.Count -eq 0) {
+    Info "DRY RUN: skipping RBAC scan (no enabled subscriptions)."
+  } else {
+    Info ("DRY RUN: scanning Azure subscriptions for RBAC role assignments linked to principalId {0}..." -f $spObjectId)
 
-    [void](Run-Az @("account","set","--subscription",$subId,"--only-show-errors"))
+    foreach ($sub in $SUBSCRIPTIONS) {
+      $subId = $sub.id
+      $subName = $sub.name
+      $scope = "/subscriptions/$subId"
 
-    foreach ($role in $RBAC_ROLES) {
-      # Use principalId filter so this works even if the SP is later deleted
-      $q = "[?principalId=='$spObjectId' && roleDefinitionName=='$role'].id"
-      $idsOut = (Run-Az @("role","assignment","list","--scope",$scope,"--query",$q,"-o","tsv","--only-show-errors")).Output
-      $ids = @($idsOut -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+      [void](Run-Az @("account","set","--subscription",$subId,"--only-show-errors"))
 
-      $dryRunFindings.Add([pscustomobject]@{
-        Subscription     = $subName
-        SubscriptionId   = $subId
-        Role             = $role
-        AssignmentsFound = $ids.Count
-        Scope            = $scope
-      }) | Out-Null
+      foreach ($role in $RBAC_ROLES) {
+        $q = "[?principalId=='$spObjectId' && roleDefinitionName=='$role'].id"
+        $idsOut = (Run-Az @("role","assignment","list","--scope",$scope,"--query",$q,"-o","tsv","--only-show-errors")).Output
+        $ids = @($idsOut -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+        $dryRunFindings.Add([pscustomobject]@{
+          Subscription     = $subName
+          SubscriptionId   = $subId
+          Role             = $role
+          AssignmentsFound = $ids.Count
+          Scope            = $scope
+        }) | Out-Null
+      }
+    }
+
+    Info ""
+    Info "DRY RUN RESULTS (RBAC role assignments by subscription and role):"
+    $dryRunFindings | Sort-Object Subscription, Role | Format-Table -AutoSize
+
+    if ($dryRunFindings.Count -gt 0) {
+      $rbacTotal = ($dryRunFindings | Measure-Object -Property AssignmentsFound -Sum).Sum
     }
   }
 
-  Info ""
-  Info "DRY RUN RESULTS (RBAC role assignments by subscription and role):"
-  $dryRunFindings | Sort-Object Subscription, Role | Format-Table -AutoSize
-
-  $rbacTotal = 0
-  if ($dryRunFindings.Count -gt 0) {
-    $rbacTotal = ($dryRunFindings | Measure-Object -Property AssignmentsFound -Sum).Sum
-  }
-
+  # =====================================================================
+  # SUMMARY
+  # =====================================================================
   $step4AppTotal          = $(if ($AppPresent) { 1 } else { 0 })
   $step4bIdUriTotal       = $(if ($ExposeApiIdentifierPresent) { 1 } else { 0 })
   $step4bScopeTotal       = $ExposeApiScopesToRemove.Count
 
   $step5SecretTotal       = $SecretsToRemove.Count
-  $step5SpTotal           = 1
+  $step5SpTotal           = $(if ($spPresent) { 1 } else { 0 })
 
   $step6RequestedTotal    = $requestedGraphToRemove.Count
   $step6ConsentTotal      = $graphAssignmentsToRemoveCount
@@ -579,11 +676,11 @@ try {
   }
 
   Info ""
-  Warn "PLEASE REVIEW THE OUT AVOVE BEFORE CONTINUING:"
+  Warn "PLEASE REVIEW THE OUTPUT ABOVE BEFORE CONTINUING:"
   Warn "The DRY RUN output above is the exact set of items this script will attempt to DELETE/REMOVE."
   Warn "If anything looks unexpected (wrong app/SP, extra secrets, unexpected roles/assignments), CANCEL now and investigate."
   Info ""
-  Info "To proceed, type REMOVE <All CAPITALS> to proceed or Press Enter to cancel (no changes will be made)."
+  Info "To proceed, type REMOVE (ALL CAPITALS) to proceed or press Enter to cancel (no changes will be made)."
   $confirm = Read-Host "Confirmation >"
 
   if ($confirm -ne "REMOVE") {
@@ -593,7 +690,6 @@ try {
 
   # =====================================================================
   # EXECUTE - Remove matching client secrets from the App Registration
-  # (done first so credentials are revoked before deleting principals/permissions)
   # =====================================================================
   Info ""
   Warn "Proceeding with client secret removal (revoking credentials) first..."
@@ -632,26 +728,28 @@ try {
   }
 
   # =====================================================================
-  # EXECUTE - Delete the service principal (revokes sign-in + removes the enterprise app object)
-  # Done early so the runtime identity is removed before cleaning up remaining permissions/assignments.
+  # EXECUTE - Delete the service principal (if present)
   # =====================================================================
   Info ""
-  Warn "Proceeding with service principal deletion (removing the Enterprise Application)..."
+  Warn "Proceeding with service principal deletion (removing the Enterprise Application) ..."
 
   $spDeleted = $false
-  $delSp = Run-Az @("ad","sp","delete","--id",$spObjectId,"--only-show-errors")
-  if ($delSp.ExitCode -eq 0) {
+  if (-not $spPresent -or -not $spObjectId -or ($spName -match "SP not found")) {
     $spDeleted = $true
-    Good ("Deleted service principal: {0} (objectId {1})" -f $spName, $spObjectId)
+    Info "Skipping service principal deletion (service principal not present in tenant)."
   } else {
-    Warn "Could not delete service principal (you may lack permission). Continuing with remaining removals."
-    if ($delSp.Output) { Warn $delSp.Output }
+    $delSp = Run-Az @("ad","sp","delete","--id",$spObjectId,"--only-show-errors")
+    if ($delSp.ExitCode -eq 0) {
+      $spDeleted = $true
+      Good ("Deleted service principal: {0} (objectId {1})" -f $spName, $spObjectId)
+    } else {
+      Warn "Could not delete service principal (you may lack permission). Continuing with remaining removals."
+      if ($delSp.Output) { Warn $delSp.Output }
+    }
   }
 
   # =====================================================================
-  #  EXECUTE - Remove Microsoft Graph application permissions configured on the app/SP
-  # - Removes admin-consent artifacts (appRoleAssignments) IF the service principal still exists
-  # - Removes requested application roles from the app registration (requiredResourceAccess)
+  # EXECUTE - Remove Microsoft Graph application permissions configured on the app/SP
   # =====================================================================
   Info ""
   Warn "Proceeding with Microsoft Graph permission cleanup (consented assignments + requested roles)..."
@@ -682,7 +780,7 @@ try {
     }
   }
   elseif ($spDeleted) {
-    Info "Skipped explicit Graph appRoleAssignment deletion because the service principal has been deleted."
+    Info "Skipped explicit Graph appRoleAssignment deletion because the service principal is missing/deleted."
   }
   else {
     Info "No matching Graph appRoleAssignments to remove."
@@ -706,20 +804,43 @@ try {
 
   # =====================================================================
   # EXECUTE - Remove Azure Service Management delegated consent + requested scope
-  # - Deletes any tenant-wide (AllPrincipals) oauth2PermissionGrant for 'user_impersonation'
-  # - Removes the corresponding delegated scope from the app registration (requiredResourceAccess)
+  # (Grant delete is idempotent; 404 ignored)
   # =====================================================================
   Info ""
   Warn "Proceeding with Azure Service Management delegated access cleanup (consent grants + requested scope)..."
 
-  if ($grantPresent) {
+  if ($grantPresent -and $matchingGrants.Count -gt 0) {
     Info ("Removing delegated consent grant(s) (AllPrincipals) for '{0}'..." -f $scopeValue)
+
+    $removed = 0
+    $skipped = 0
+    $failed  = 0
+
     foreach ($g in $matchingGrants) {
-      Invoke-Graph -Method DELETE -Uri ("https://graph.microsoft.com/v1.0/oauth2PermissionGrants/{0}" -f $g.id) | Out-Null
+      try {
+        Invoke-Graph -Method DELETE -Uri ("https://graph.microsoft.com/v1.0/oauth2PermissionGrants/{0}" -f $g.id) | Out-Null
+        $removed++
+      }
+      catch {
+        $m = $_.Exception.Message
+        if ($m -match "\(404\)" -or $m -match "Request_ResourceNotFound") {
+          $skipped++
+          Info ("Grant already removed (404): {0}" -f $g.id)
+        } else {
+          $failed++
+          Warn ("Failed to delete grant id: {0}" -f $g.id)
+          Warn $m
+        }
+      }
     }
-    Good ("Removed {0} delegated consent grant(s)." -f $matchingGrants.Count)
+
+    if ($failed -eq 0) {
+      Good ("Delegated consent grants removed: {0} (already gone: {1})" -f $removed, $skipped)
+    } else {
+      Warn ("Delegated consent grants removed: {0}, already gone: {1}, failed: {2}" -f $removed, $skipped, $failed)
+    }
   } else {
-    Info "No delegated consent grants to remove."
+    Info "No delegated consent grants to remove (or could not enumerate)."
   }
 
   if ($requestedPresent) {
@@ -737,16 +858,17 @@ try {
 
   # =====================================================================
   # EXECUTE - Remove Azure RBAC role assignments at subscription scope
-  # - Enumerates the target roles in each enabled subscription
-  # - Deletes any matching role assignments for the target principalId
-  # - Produces a per-subscription / per-role removal summary
   # =====================================================================
   Info ""
   Warn "Proceeding with Azure RBAC role assignment cleanup across enabled subscriptions..."
 
-  if ($rbacTotal -eq 0) {
+  if (-not $spObjectId) {
+    Warn "Skipping RBAC removal (principalId is unknown). If the SP was already deleted, set `$SP_OBJECT_ID_OVERRIDE and re-run."
+  }
+  elseif ($rbacTotal -eq 0) {
     Good "No RBAC assignments found to remove. Skipping RBAC removal."
-  } else {
+  }
+  else {
     $removalSummary = New-Object System.Collections.Generic.List[psobject]
 
     foreach ($sub in $SUBSCRIPTIONS) {
@@ -805,8 +927,7 @@ try {
 
   # =====================================================================
   # EXECUTE - Remove "Expose an API" configuration on the App Registration
-  # - Removes any oauth2PermissionScopes where value == $ExposeApiScopeValue (e.g. user_impersonation)
-  # - Removes the identifierUri "api://<APP_ID>" if present
+  # FIX: disable scope(s) first, then remove
   # =====================================================================
   Info ""
   Warn "Proceeding with app 'Expose an API' cleanup (scopes + identifier URI)..."
@@ -817,22 +938,53 @@ try {
     try {
       $appNow = Invoke-Graph -Method GET -Uri ("https://graph.microsoft.com/v1.0/applications/{0}?`$select=identifierUris,api" -f $appObjectId)
 
-      # Remove oauth2PermissionScopes with value == user_impersonation
+      # ---- Scopes ----
       $existingScopes = @()
       if ($appNow.api -and $appNow.api.oauth2PermissionScopes) { $existingScopes = @($appNow.api.oauth2PermissionScopes) }
 
-      $scopesRemoveNow = @($existingScopes | Where-Object { $_.value -eq $ExposeApiScopeValue })
-      if ($scopesRemoveNow.Count -gt 0) {
+      $targetScopes = @($existingScopes | Where-Object { $_.value -eq $ExposeApiScopeValue })
+      if ($targetScopes.Count -gt 0) {
+
+        # 1) Disable any enabled target scope(s)
+        $needsDisable = @($targetScopes | Where-Object { $_.isEnabled -eq $true })
+        if ($needsDisable.Count -gt 0) {
+
+          $disabledScopes = foreach ($s in $existingScopes) {
+            $isTarget = ($s.value -eq $ExposeApiScopeValue)
+            [pscustomobject]@{
+              id                     = $s.id
+              value                  = $s.value
+              type                   = $s.type
+              isEnabled              = $(if ($isTarget) { $false } else { [bool]$s.isEnabled })
+              adminConsentDisplayName= $s.adminConsentDisplayName
+              adminConsentDescription= $s.adminConsentDescription
+              userConsentDisplayName = $s.userConsentDisplayName
+              userConsentDescription = $s.userConsentDescription
+            }
+          }
+
+          $disableBody = @{ api = @{ oauth2PermissionScopes = $disabledScopes } } | ConvertTo-Json -Depth 50 -Compress
+          Invoke-Graph -Method PATCH -Uri ("https://graph.microsoft.com/v1.0/applications/{0}" -f $appObjectId) -BodyJson $disableBody | Out-Null
+          Good ("Disabled {0} exposed API scope(s) with value '{1}'." -f $needsDisable.Count, $ExposeApiScopeValue)
+
+          # Re-read after disabling (avoids eventual consistency weirdness)
+          $appNow = Invoke-Graph -Method GET -Uri ("https://graph.microsoft.com/v1.0/applications/{0}?`$select=api" -f $appObjectId)
+          $existingScopes = @()
+          if ($appNow.api -and $appNow.api.oauth2PermissionScopes) { $existingScopes = @($appNow.api.oauth2PermissionScopes) }
+        }
+
+        # 2) Remove target scope(s)
         $remainingScopes = @($existingScopes | Where-Object { $_.value -ne $ExposeApiScopeValue })
 
-        $patchBody = @{ api = @{ oauth2PermissionScopes = $remainingScopes } } | ConvertTo-Json -Depth 50 -Compress
-        Invoke-Graph -Method PATCH -Uri ("https://graph.microsoft.com/v1.0/applications/{0}" -f $appObjectId) -BodyJson $patchBody | Out-Null
-        Good ("Removed {0} exposed API scope(s) with value '{1}'." -f $scopesRemoveNow.Count, $ExposeApiScopeValue)
+        $removeBody = @{ api = @{ oauth2PermissionScopes = $remainingScopes } } | ConvertTo-Json -Depth 50 -Compress
+        Invoke-Graph -Method PATCH -Uri ("https://graph.microsoft.com/v1.0/applications/{0}" -f $appObjectId) -BodyJson $removeBody | Out-Null
+        Good ("Removed exposed API scope(s) with value '{0}'." -f $ExposeApiScopeValue)
+
       } else {
         Info ("No exposed API scopes found with value '{0}'." -f $ExposeApiScopeValue)
       }
 
-      # Remove identifierUri api://<APP_ID>
+      # ---- Identifier URI ----
       $idUris = @()
       if ($appNow.identifierUris) { $idUris = @($appNow.identifierUris) }
 
