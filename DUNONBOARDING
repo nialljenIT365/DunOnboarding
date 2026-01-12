@@ -1,0 +1,1084 @@
+<#
+.SYNOPSIS
+  DUN Security - Azure Tenant Onboarding Script (Windows/PowerShell)
+
+.VERSION
+  Version: 1.0.2
+  Last Updated: 2026-01-12
+
+.DESCRIPTION
+  Creates and configures the Microsoft Entra ID / Azure artifacts required for DUN Security onboarding, including:
+    - App registration + redirect URI
+    - "Expose an API" configuration for OBO token exchange (identifierUri + user_impersonation scope)
+    - Service principal (Enterprise Application)
+    - Client secret creation via Microsoft Graph (addPassword)
+    - Microsoft Graph application permissions + admin consent (Global Administrator required)
+    - Azure Service Management delegated permission + tenant-wide consent grant (AllPrincipals) (Global Administrator required)
+    - Subscription-scope RBAC role assignments
+    - Optional: Network flow logs + optional Traffic Analytics (needs to be tested)
+    - Optional: Sentinel workspace access (needs to be tested)
+    - Optional: Auto-provisioning of the DUN dashboard (else outputs a secure manual sharing workflow)
+
+  Script reliability / compatibility improvements:
+    - Reduced/cleaned console output patterns to avoid parsing issues in PowerShell hosts
+      (no broken quotes, NoNewline chains, or stray ampersands).
+    - Cloud Shell-friendly: avoids exit/termination patterns where possible and detects Cloud Shell for prerequisites.
+    - Tenant display name fallback: if tenantDisplayName is blank in some CLI contexts, queries Microsoft Graph organization.
+    - Directory role safety: attempts to validate whether Global Administrator is active (incl. PIM activation) and warns before GA-only operations.
+    - Cloud Shell retry logic for admin consent when MSI token audience limitations are detected (device-code re-auth + retry).
+
+.NOTES
+  - No intermediate/temp files (Graph PATCH/POST used directly)
+  - Cloud Shell quick launch: https://shell.azure.com
+  - If auto-provisioning is skipped/failed, warns user DO NOT paste Client Secret into email/chat; use an expiring OneDrive/SharePoint link as instructed .
+#>
+
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# console helpers
+# -----------------------------
+function Info  { param([string]$m) Write-Host $m -ForegroundColor Cyan }
+function Good  { param([string]$m) Write-Host $m -ForegroundColor Green }
+function Warn  { param([string]$m) Write-Host $m -ForegroundColor Yellow }
+function Bad   { param([string]$m) Write-Host $m -ForegroundColor Red }
+
+function Run-Az {
+  param([Parameter(Mandatory=$true)][string[]]$Args)
+
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  $out = & az @Args 2>&1
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = $prev
+
+  [pscustomobject]@{
+    ExitCode = $code
+    Output   = ($out | Out-String).Trim()
+  }
+}
+
+function Get-GraphToken {
+  $t = (Run-Az @("account","get-access-token","--resource-type","ms-graph","--query","accessToken","-o","tsv")).Output
+  if (-not $t) {
+    $t = (Run-Az @("account","get-access-token","--resource","https://graph.microsoft.com/","--query","accessToken","-o","tsv")).Output
+  }
+  if (-not $t) { throw "Failed to acquire Microsoft Graph access token from Azure CLI." }
+  $t.Trim()
+}
+
+function Invoke-Graph {
+  param(
+    [Parameter(Mandatory=$true)][ValidateSet("GET","POST","PATCH","DELETE")][string]$Method,
+    [Parameter(Mandatory=$true)][string]$Uri,
+    [Parameter(Mandatory=$false)][string]$BodyJson
+  )
+
+  $token = Get-GraphToken
+  $headers = @{
+    Authorization = "Bearer $token"
+    "Content-Type" = "application/json"
+  }
+
+  try {
+    if ($PSBoundParameters.ContainsKey("BodyJson")) {
+      return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $BodyJson
+    } else {
+      return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
+    }
+  }
+  catch {
+    $msg = $_.Exception.Message
+    if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
+      try {
+        $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+        $resp = $sr.ReadToEnd()
+        if ($resp) { $msg = "$msg`n$resp" }
+      } catch { }
+    }
+    throw $msg
+  }
+}
+
+function Get-TenantDisplayNameFallback {
+  # tenantDisplayName can be blank in some CLI contexts (notably Cloud Shell).
+  # Use Microsoft Graph organization as a fallback.
+  try {
+    $name = (Run-Az @(
+      "rest",
+      "--method","GET",
+      "--uri","https://graph.microsoft.com/v1.0/organization?`$select=displayName,id",
+      "--query","value[0].displayName",
+      "-o","tsv"
+    )).Output
+
+    if ($name) { return $name.Trim() }
+  } catch { }
+
+  return $null
+}
+
+function Get-SignedInUserObjectId {
+  # Try to resolve the signed-in user's Entra ID objectId
+  try {
+    $meId = (Run-Az @("ad","signed-in-user","show","--query","id","-o","tsv")).Output
+    if ($meId) { return $meId.Trim() }
+  } catch { }
+
+  # Fallback via signed-in UPN
+  $upn = (Run-Az @("account","show","--query","user.name","-o","tsv")).Output
+  if ($upn) {
+    $meId = (Run-Az @("ad","user","show","--id",$upn.Trim(),"--query","id","-o","tsv")).Output
+    if ($meId) { return $meId.Trim() }
+  }
+
+  return $null
+}
+
+function Test-GlobalAdminActive {
+  # Global Administrator roleDefinitionId in Microsoft Graph
+  $gaRoleDefinitionId = "62e90394-69f5-4237-9190-012177145e10"
+  $meId = Get-SignedInUserObjectId
+
+  if (-not $meId) {
+    Warn "Could not resolve the signed-in user's Entra ID objectId, so Global Administrator status could not be validated."
+    return $false
+  }
+
+  try {
+    # Active role assignments (covers permanent assignment + PIM activation)
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=principalId eq '$meId' and roleDefinitionId eq '$gaRoleDefinitionId'&`$select=id"
+    $json = (Run-Az @("rest","--method","GET","--uri",$uri,"-o","json")).Output
+    $resp = if ($json) { $json | ConvertFrom-Json } else { $null }
+
+    $isActive = ($resp -and $resp.value -and $resp.value.Count -gt 0)
+
+    if ($isActive) {
+      Good "Global Administrator role is ACTIVE for the signed-in user (permanent or PIM-activated)."
+      return $true
+    } else {
+      Warn "Global Administrator role is NOT active for the signed-in user (or not currently activated via PIM)."
+      return $false
+    }
+  }
+  catch {
+    Warn "Could not query Microsoft Graph to validate Global Administrator status."
+    Warn "If you use PIM, ensure the role is activated; otherwise you may not have rights to read role assignments."
+    return $false
+  }
+}
+
+# =====================================================================
+# START
+# =====================================================================
+Info "DUN Security - Azure Onboarding"
+Info "Tip: Azure Cloud Shell: https://shell.azure.com"
+Info "Press Enter to continue, or Ctrl+C to cancel..."
+$null = Read-Host
+
+# =====================================================================
+# Step 1: Prerequisites
+# =====================================================================
+Info "Step 1: Prerequisites"
+
+# Detect Azure Cloud Shell (PowerShell or Bash-backed). In Cloud Shell, Azure CLI is always present.
+$IsCloudShell = $false
+try {
+  if ($env:ACC_CLOUD -or $env:AZUREPS_HOST_ENVIRONMENT -or $env:AZURE_HTTP_USER_AGENT -or $env:POWERSHELL_DISTRIBUTION_CHANNEL -match "CloudShell") {
+    $IsCloudShell = $true
+  }
+} catch { }
+
+if ($IsCloudShell) {
+  Good "Running in Azure Cloud Shell (Azure CLI available)"
+} else {
+  if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    Bad  "Azure CLI is not installed."
+    Info "Install: https://aka.ms/installazurecliwindows"
+    Info "Or run:  winget install -e --id Microsoft.AzureCLI"
+    Warn "No changes were made."
+    return
+  }
+  Good "Azure CLI is installed"
+}
+
+# =====================================================================
+# Step 2: Organization Information
+# =====================================================================
+Info "Step 2: Organization Information"
+Info "Enter your organization name (e.g., Acme Corp, Contoso):"
+$ORG_NAME = Read-Host ">"
+
+if ([string]::IsNullOrWhiteSpace($ORG_NAME)) {
+  Bad "Organization name cannot be empty. No changes were made."
+  return
+}
+
+$APP_DISPLAY_NAME = "DUN Security - $ORG_NAME"
+
+# Derive URL-safe slug
+$CLIENT_SLUG = $ORG_NAME.ToLower() -replace '[^a-z0-9-]', '-' -replace '-+', '-'
+$CLIENT_SLUG = $CLIENT_SLUG.Trim('-')
+
+Good "Organization: $ORG_NAME"
+Good "App Name: $APP_DISPLAY_NAME"
+
+# =====================================================================
+# Step 3: Azure Authentication
+# =====================================================================
+Info "Step 3: Azure Authentication"
+Warn "You will need Global Administrator or Privileged Role Administrator access."
+
+try {
+  $account = az account show --query "{id:id, tenantId:tenantId, name:tenantDisplayName, user:user.name}" -o json | ConvertFrom-Json
+  Good "Signed in as: $($account.user)"
+  Info "Is this the correct administrator account? (y/n)"
+  $confirm = Read-Host ">"
+
+  if ($confirm -notmatch '^[Yy]$') {
+    Warn "Please sign in with the correct account..."
+    az login | Out-Null
+    $account = az account show --query "{id:id, tenantId:tenantId, name:tenantDisplayName, user:user.name}" -o json | ConvertFrom-Json
+  }
+}
+catch {
+  Warn "Please sign in with your administrator account..."
+  az login | Out-Null
+  $account = az account show --query "{id:id, tenantId:tenantId, name:tenantDisplayName, user:user.name}" -o json | ConvertFrom-Json
+}
+
+# Normalize tenant name (Cloud Shell fallback) and keep $account consistent
+if ([string]::IsNullOrWhiteSpace($account.name)) {
+  $fallbackName = Get-TenantDisplayNameFallback
+  if ($fallbackName) {
+    $account.name = $fallbackName
+  } else {
+    $account.name = "(Tenant display name unavailable in this session)"
+  }
+}
+
+$TENANT_ID   = $account.tenantId
+$SUB_ID      = $account.id
+$TENANT_NAME = $account.name
+
+Good "Authenticated successfully"
+Info "Tenant: $TENANT_NAME"
+Info "Tenant ID: $TENANT_ID"
+
+# Validate GA (active) once early; used for GA-only warnings later
+$IsGlobalAdminActive = Test-GlobalAdminActive
+
+# =====================================================================
+# Step 4: Create App Registration
+# =====================================================================
+Info "Step 4: Create App Registration"
+
+$REDIRECT_URI = "https://app-dun-$CLIENT_SLUG-prod.azurewebsites.net/api/auth/callback/azure-ad"
+Info "Creating App Registration: $APP_DISPLAY_NAME"
+Info "Redirect URI: $REDIRECT_URI"
+
+$APP_ID = az ad app create `
+  --display-name $APP_DISPLAY_NAME `
+  --web-redirect-uris $REDIRECT_URI `
+  --query appId -o tsv
+
+if (-not $APP_ID) {
+  Bad "Failed to create App Registration. No further actions were taken."
+  return
+}
+
+Good "App Registration created"
+Info "Client ID (appId): $APP_ID"
+
+# =====================================================================
+# Step 4b: Configure API for OBO token exchange (Expose an API)
+#   - Sets identifier URI: api://<APP_ID>
+#   - Adds oauth2PermissionScope: user_impersonation
+# =====================================================================
+Info "Step 4b: Configure API for token exchange (OBO)"
+
+# Set Application ID URI
+az ad app update --id $APP_ID --identifier-uris "api://$APP_ID" 2>$null
+if ($LASTEXITCODE -eq 0) {
+  Good "Application ID URI set: api://$APP_ID"
+} else {
+  Warn "Could not set Application ID URI (you may need to configure it manually)."
+}
+
+# Resolve the app's object ID (Graph uses objectId, not appId)
+$APP_OBJECT_ID = az ad app show --id $APP_ID --query "id" -o tsv
+if (-not $APP_OBJECT_ID) {
+  Warn "Could not resolve App objectId. Exposed API scope setup may be skipped."
+} else {
+  $SCOPE_ID = [guid]::NewGuid().ToString()
+
+  $scopeBody = @{
+    adminConsentDescription  = "Allow DUN Security to access Azure resources on behalf of the signed-in user for AI-driven remediation"
+    adminConsentDisplayName  = "Access Azure for AI Remediation"
+    id                       = $SCOPE_ID
+    isEnabled                = $true
+    type                     = "User"
+    userConsentDescription   = "Allow DUN Security to fix Azure security issues on your behalf using AI"
+    userConsentDisplayName   = "Fix Azure security issues with AI"
+    value                    = "user_impersonation"
+  }
+
+  try {
+    $uri = "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID"
+
+    # Fetch existing scopes so we don't overwrite them
+    $existing = Invoke-Graph -Method GET -Uri ($uri + "?`$select=api")
+    $existingScopes = @()
+    if ($existing.api -and $existing.api.oauth2PermissionScopes) {
+      $existingScopes = @($existing.api.oauth2PermissionScopes)
+    }
+
+    $alreadyThere = $false
+    if ($existingScopes.Count -gt 0) {
+      $alreadyThere = $existingScopes | Where-Object { $_.value -eq "user_impersonation" } | Select-Object -First 1
+    }
+
+    if ($alreadyThere) {
+      Good "API scope already present (user_impersonation)"
+    } else {
+      $patchBody = @{
+        api = @{
+          oauth2PermissionScopes = @($existingScopes + $scopeBody)
+        }
+      } | ConvertTo-Json -Depth 20 -Compress
+
+      Invoke-Graph -Method PATCH -Uri $uri -BodyJson $patchBody | Out-Null
+      Good "API scope configured for OBO token exchange (user_impersonation)"
+    }
+  }
+  catch {
+    Warn "Could not configure API scope (may require manual setup)."
+    Warn $_
+  }
+}
+
+# =====================================================================
+# Step 5: Create Service Principal (Enterprise Application)
+# =====================================================================
+Info "Step 5: Create Service Principal"
+
+try {
+  $SP_ID = az ad sp create --id $APP_ID --query id -o tsv 2>&1
+  if ($LASTEXITCODE -eq 0 -and $SP_ID) {
+    Good "Service Principal created"
+  } else {
+    throw "Creation failed"
+  }
+}
+catch {
+  Warn "Service Principal might already exist; retrieving..."
+  $SP_ID = az ad sp show --id $APP_ID --query id -o tsv 2>$null
+  if ($SP_ID) {
+    Good "Found existing Service Principal"
+  } else {
+    Bad "Failed to create or resolve Service Principal. No further actions were taken."
+    return
+  }
+}
+
+# =====================================================================
+# Step 5b: Create client secret (Graph addPassword)
+# =====================================================================
+Info "Step 5b: Create client secret for SSO (2-year expiry)"
+
+$CLIENT_SECRET = $null
+$CLIENT_SECRET_KEYID = $null
+
+if (-not $APP_OBJECT_ID) {
+  Warn "App objectId is not available, so client secret creation will be skipped."
+} else {
+  $endDateTime = (Get-Date).ToUniversalTime().AddYears(2).ToString("o")
+  $body = @{
+    passwordCredential = @{
+      displayName = "DUN-SSO-Secret"
+      endDateTime = $endDateTime
+    }
+  } | ConvertTo-Json -Depth 10 -Compress
+
+  try {
+    $uri = "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID/addPassword"
+    $resp = Invoke-Graph -Method POST -Uri $uri -BodyJson $body
+
+    # secretText only returned once
+    $CLIENT_SECRET = ($resp.secretText | ForEach-Object { $_.ToString().Trim() })
+    $CLIENT_SECRET_KEYID = $resp.keyId
+
+    if ($CLIENT_SECRET) {
+      Good "Client secret created (expires: $endDateTime)"
+    } else {
+      Warn "Graph call succeeded but secretText was empty (unexpected)."
+    }
+  }
+  catch {
+    Warn "Failed to create client secret via Graph."
+    Warn $_
+  }
+}
+
+# =====================================================================
+# Step 6: Configure Microsoft Graph API Permissions (application perms)
+#   - Requests required app roles on the app registration
+#   - Admin-consent (Global Admin required)
+# =====================================================================
+Info "Step 6: Configure Microsoft Graph API Permissions (application permissions)"
+
+$MS_GRAPH_ID = "00000003-0000-0000-c000-000000000000"
+
+# Required application permission IDs (app roles)
+$GRAPH_APP_ROLE_IDS = @(
+  "7ab1d382-f21e-4acd-a863-ba3e13f7da61" # Directory.Read.All
+  "9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30" # Application.Read.All
+  "c7fbd983-d9aa-4fa7-84b8-17382c103bc4" # RoleManagement.Read.All
+  "df021288-bdef-4463-88db-98f22de89214" # User.Read.All
+  "246dd0d5-5bd0-4def-940b-0421030a5b68" # Policy.Read.All
+  "b0afded3-3588-46d8-8b3d-9842eff778da" # AuditLog.Read.All
+  "230c1aed-a721-4c5d-9cb4-a90514e508ef" # Reports.Read.All
+  "38d9df27-64da-44fd-b7c5-a6fbac20248f" # UserAuthenticationMethod.Read.All
+) | ForEach-Object { $_.ToLower() } | Select-Object -Unique
+
+# Read existing requested perms to avoid duplicates
+$existingIds = @(
+  az ad app show --id $APP_ID `
+    --query "requiredResourceAccess[?resourceAppId=='$MS_GRAPH_ID'].resourceAccess[].id" `
+    -o tsv --only-show-errors 2>$null
+) | Where-Object { $_ } | Select-Object -Unique
+
+# Add missing only
+$missingPerms = @()
+foreach ($rid in $GRAPH_APP_ROLE_IDS) {
+  if ($existingIds -notcontains $rid) {
+    $missingPerms += "$rid=Role"
+  }
+}
+
+if (-not $missingPerms -or $missingPerms.Count -eq 0) {
+  Good "Graph application permissions already requested (no changes)."
+} else {
+  Info ("Requesting missing Graph permissions: " + ($missingPerms -join ", "))
+  $addOut  = az ad app permission add --id $APP_ID --api $MS_GRAPH_ID --api-permissions $missingPerms --only-show-errors 2>&1
+  if ($LASTEXITCODE -eq 0) {
+    Good "Requested missing Graph permissions (requiredResourceAccess updated)."
+  } else {
+    Warn "Failed requesting Graph permissions."
+    Warn ($addOut | Out-String)
+  }
+}
+
+# ---- GA-only warning before admin consent
+Info ""
+Warn "Admin consent is a Global Administrator-only operation."
+if (-not $IsGlobalAdminActive) {
+  Warn "Global Administrator role does not appear active for the signed-in user. If you use PIM, activate GA before continuing."
+}
+
+Info "Granting admin consent for the configured Graph permissions..."
+$consentOut  = az ad app permission admin-consent --id $APP_ID --only-show-errors 2>&1
+
+if ($LASTEXITCODE -eq 0) {
+  Good "Admin consent granted for Graph application permissions."
+} else {
+  Warn "Admin consent failed."
+  Warn "You must be logged in as a Global Administrator (or have the required directory privileges)."
+  Warn ($consentOut | Out-String)
+}
+
+# =====================================================================
+# Step 6b: Azure Service Management delegated permission (user_impersonation)
+#   - Requests delegated scope on app registration
+#   - Grants tenant-wide delegated consent (AllPrincipals) (Global Admin required)
+# =====================================================================
+Info "Step 6b: Configure Azure Service Management delegated permission (user_impersonation)"
+
+$AZURE_MGMT_APPID = "797f4846-ba00-4fd7-ba43-dac1f8f63013"
+$scopeValue       = "user_impersonation"
+
+$resourceSpId = az ad sp show --id $AZURE_MGMT_APPID --query id -o tsv --only-show-errors 2>$null
+if (-not $resourceSpId) {
+  Bad "Could not resolve Azure Service Management API service principal ($AZURE_MGMT_APPID)."
+  return
+}
+
+# Resolve delegated scope GUID dynamically
+$USER_IMPERSONATION_ID = az ad sp show --id $AZURE_MGMT_APPID `
+  --query "oauth2PermissionScopes[?value=='$scopeValue'].id | [0]" -o tsv --only-show-errors 2>$null
+if (-not $USER_IMPERSONATION_ID) {
+  $USER_IMPERSONATION_ID = az ad sp show --id $AZURE_MGMT_APPID `
+    --query "oauth2Permissions[?value=='$scopeValue'].id | [0]" -o tsv --only-show-errors 2>$null
+}
+if (-not $USER_IMPERSONATION_ID) {
+  Bad "Could not resolve scope id for '$scopeValue' on Azure Service Management API."
+  return
+}
+
+# 1) Request delegated permission (requiredResourceAccess)
+$alreadyRequested = az ad app show --id $APP_ID `
+  --query "requiredResourceAccess[?resourceAppId=='$AZURE_MGMT_APPID'].resourceAccess[?id=='$USER_IMPERSONATION_ID' && type=='Scope'] | length(@)" `
+  -o tsv --only-show-errors 2>$null
+
+if ($alreadyRequested -and [int]$alreadyRequested -gt 0) {
+  Good "Delegated permission already requested in requiredResourceAccess (Azure Mgmt / user_impersonation)."
+} else {
+  Info "Requesting delegated permission: Azure Service Management API / user_impersonation"
+  $addOut = az ad app permission add --id $APP_ID --api $AZURE_MGMT_APPID --api-permissions "$USER_IMPERSONATION_ID=Scope" --only-show-errors 2>&1
+  if ($LASTEXITCODE -eq 0 -or ($addOut -match "already exists")) {
+    Good "Requested delegated permission (requiredResourceAccess updated)."
+  } else {
+    Warn "Failed to request delegated permission."
+    Warn ($addOut | Out-String)
+    Warn "Cannot continue with delegated consent without the requested permission."
+    return
+  }
+}
+
+# 2) Grant tenant-wide consent (AllPrincipals) - GA-only
+Info ""
+Warn "Tenant-wide delegated consent (AllPrincipals) is a Global Administrator-only operation."
+if (-not $IsGlobalAdminActive) {
+  Warn "Global Administrator role does not appear active for the signed-in user. If you use PIM, activate GA before continuing."
+}
+
+Info "Granting tenant-wide delegated consent (AllPrincipals) for user_impersonation..."
+$grantOut = az ad app permission grant --id $SP_ID --api $resourceSpId --scope $scopeValue --consent-type AllPrincipals --only-show-errors 2>&1
+if ($LASTEXITCODE -eq 0) {
+  Good "Delegated consent command completed (AllPrincipals)."
+} else {
+  Warn "Delegated consent failed."
+  Warn ($grantOut | Out-String)
+  Warn "This typically requires Global Administrator."
+}
+
+# =====================================================================
+# Step 7: Assign Azure RBAC Roles
+# =====================================================================
+Info "Step 7: Assign Azure RBAC Roles"
+
+Info "Discovering enabled subscriptions..."
+$SUBSCRIPTIONS = az account list --query "[?state=='Enabled'].{id:id, name:name}" -o json | ConvertFrom-Json
+$SUB_COUNT = if ($SUBSCRIPTIONS) { $SUBSCRIPTIONS.Count } else { 0 }
+
+if ($SUB_COUNT -eq 0) {
+  Bad "No enabled subscriptions found. RBAC assignment will be skipped."
+} else {
+  Info "Found $SUB_COUNT enabled subscription(s):"
+  foreach ($s in $SUBSCRIPTIONS) { Info (" - {0} ({1})" -f $s.name, $s.id) }
+
+  Warn "DUN Security will be granted roles at subscription scope on ALL these subscriptions."
+  $CONFIRM_SUBS = Read-Host "Continue with role assignment? (y/n) >"
+  if ($CONFIRM_SUBS -notmatch '^[Yy]$') {
+    Warn "Skipped RBAC assignment by user choice."
+  } else {
+    $RBAC_ROLES = @(
+      @{Role="Reader";                   Desc="Browse resources and RBAC assignments"},
+      @{Role="Security Reader";          Desc="Defender for Cloud access"},
+      @{Role="Key Vault Reader";         Desc="Key Vault configuration visibility"},
+      @{Role="Log Analytics Reader";     Desc="Security log queries"},
+      @{Role="Network Contributor";      Desc="Enable NSG/VNet flow logs"},
+      @{Role="Storage Account Contributor"; Desc="Create / manage flow log storage"}
+    )
+
+    $SubscriptionResults = @{}
+
+    foreach ($subscription in $SUBSCRIPTIONS) {
+      $SubId   = $subscription.id
+      $SubName = $subscription.name
+
+      Info ""
+      Info "Assigning roles on subscription: $SubName"
+      az account set --subscription $SubId 2>$null
+
+      $RoleFailures = 0
+      foreach ($RoleInfo in $RBAC_ROLES) {
+        $Role = $RoleInfo.Role
+        $result = az role assignment create `
+          --assignee $SP_ID `
+          --role $Role `
+          --scope "/subscriptions/$SubId" `
+          --output none 2>&1
+
+        if ($LASTEXITCODE -ne 0 -and $result -notmatch "already exists") {
+          $RoleFailures++
+          Warn ("Role assignment failed for '{0}' on {1}" -f $Role, $SubName)
+        }
+      }
+
+      if ($RoleFailures -eq 0) {
+        Good "All roles assigned successfully (or already existed)"
+        $SubscriptionResults[$SubName] = "Success"
+      } elseif ($RoleFailures -lt $RBAC_ROLES.Count) {
+        Warn "Some roles failed to assign (others succeeded or already existed)"
+        $SubscriptionResults[$SubName] = "Partial"
+      } else {
+        Bad "Failed to assign roles on this subscription"
+        $SubscriptionResults[$SubName] = "Failed"
+      }
+    }
+  }
+}
+
+# =====================================================================
+# Step 8: Enable Network Flow Logs (Optional)
+# =====================================================================
+Info ""
+Info "Step 8: Enable Network Flow Logs (Optional)"
+Info "Enable Network Flow Logs? [Y/n] (default: Yes)"
+$FLOW_LOGS_INPUT = Read-Host ">"
+$ENABLE_FLOW_LOGS = ($FLOW_LOGS_INPUT -eq "" -or $FLOW_LOGS_INPUT -match '^[Yy]')
+
+$ENABLE_TRAFFIC_ANALYTICS   = $false
+$LA_WORKSPACE_ID            = $null
+$LA_WORKSPACE_RESOURCE_ID   = $null
+$SENTINEL_WORKSPACE_ID      = $null
+
+if ($ENABLE_FLOW_LOGS -and $SUBSCRIPTIONS -and $SUBSCRIPTIONS.Count -gt 0) {
+  Info "Enable Traffic Analytics? [y/N] (default: No)"
+  $TA_INPUT = Read-Host ">"
+  $ENABLE_TRAFFIC_ANALYTICS = ($TA_INPUT -match '^[Yy]$')
+
+  if ($ENABLE_TRAFFIC_ANALYTICS) {
+    Info "Enter Log Analytics Workspace ID for Traffic Analytics (blank to skip):"
+    $LA_WORKSPACE_ID = Read-Host ">"
+    if (-not [string]::IsNullOrWhiteSpace($LA_WORKSPACE_ID)) {
+      foreach ($subscription in $SUBSCRIPTIONS) {
+        az account set --subscription $subscription.id 2>$null
+        $workspaces = az monitor log-analytics workspace list --query "[?customerId=='$LA_WORKSPACE_ID'].id" -o tsv 2>$null
+        if ($workspaces) { $LA_WORKSPACE_RESOURCE_ID = $workspaces; break }
+      }
+    }
+
+    if (-not $LA_WORKSPACE_RESOURCE_ID) {
+      Warn "Could not find Log Analytics workspace; Traffic Analytics will be skipped."
+      $ENABLE_TRAFFIC_ANALYTICS = $false
+    }
+  }
+
+  Info "Configuring Network Flow Logs..."
+
+  $FlowLogStats = @{
+    StorageAccountsCreated = 0
+    FlowLogsEnabled        = 0
+    VNetsProcessed         = 0
+    Errors                 = @()
+  }
+
+  foreach ($subscription in $SUBSCRIPTIONS) {
+    $SubId   = $subscription.id
+    $SubName = $subscription.name
+
+    Info ""
+    Info "Subscription: $SubName"
+    az account set --subscription $SubId 2>$null
+
+    $VNETS = az network vnet list --query "[].{id:id, name:name, location:location, rg:resourceGroup}" -o json 2>$null | ConvertFrom-Json
+    $NSGS  = az network nsg  list --query "[].{id:id, name:name, location:location, rg:resourceGroup}" -o json 2>$null | ConvertFrom-Json
+
+    if ((-not $VNETS -or $VNETS.Count -eq 0) -and (-not $NSGS -or $NSGS.Count -eq 0)) {
+      Warn "No VNets or NSGs found in this subscription"
+      continue
+    }
+
+    $VNetRegions = if ($VNETS) { $VNETS | Select-Object -ExpandProperty location -Unique } else { @() }
+    $NsgRegions  = if ($NSGS)  { $NSGS  | Select-Object -ExpandProperty location -Unique } else { @() }
+    $REGIONS     = ($VNetRegions + $NsgRegions) | Select-Object -Unique
+
+    foreach ($REGION in $REGIONS) {
+      Info ""
+      Info "Region: $REGION"
+
+      $NW_RG = "NetworkWatcherRG"
+
+      try { az group create --name $NW_RG --location $REGION --output none 2>$null } catch { }
+      try { az network watcher configure --resource-group $NW_RG --locations $REGION --enabled true --output none 2>$null } catch { }
+
+      $HashInput  = "$SubId-$REGION"
+      $HashBytes  = [System.Text.Encoding]::UTF8.GetBytes($HashInput)
+      $Hash       = [System.BitConverter]::ToString((New-Object System.Security.Cryptography.MD5CryptoServiceProvider).ComputeHash($HashBytes)).Replace("-","").Substring(0,8).ToLower()
+      $CleanRegion = $REGION -replace '[^a-z0-9]', ''
+      $STORAGE_NAME = "dunflow$CleanRegion$Hash"
+      if ($STORAGE_NAME.Length -gt 24) { $STORAGE_NAME = $STORAGE_NAME.Substring(0,24) }
+
+      $StorageExists = az storage account show --name $STORAGE_NAME --resource-group $NW_RG 2>$null
+      if (-not $StorageExists) {
+        Info "Creating storage account: $STORAGE_NAME"
+        try {
+          az storage account create `
+            --name $STORAGE_NAME `
+            --resource-group $NW_RG `
+            --location $REGION `
+            --sku Standard_LRS `
+            --kind StorageV2 `
+            --tags purpose=dun-flow-logs managed-by=dun-onboarding `
+            --output none 2>$null
+          $FlowLogStats.StorageAccountsCreated++
+        } catch {
+          $FlowLogStats.Errors += "Failed to create storage account $STORAGE_NAME"
+        }
+      }
+
+      $STORAGE_ID = az storage account show --name $STORAGE_NAME --resource-group $NW_RG --query id -o tsv 2>$null
+      if (-not $STORAGE_ID) {
+        Warn "Could not create/find storage account"
+        $FlowLogStats.Errors += "Could not find storage account $STORAGE_NAME in $REGION"
+        continue
+      }
+
+      $RegionVNets = $VNETS | Where-Object { $_.location -eq $REGION }
+      if ($RegionVNets) {
+        foreach ($vnet in $RegionVNets) {
+          $VNET_ID   = $vnet.id
+          $VNET_NAME = $vnet.name
+          $FlowLogStats.VNetsProcessed++
+
+          try {
+            $flowLogArgs = @(
+              "network","watcher","flow-log","create",
+              "--location",$REGION,
+              "--name","vnetflowlog-$VNET_NAME",
+              "--vnet",$VNET_ID,
+              "--storage-account",$STORAGE_ID,
+              "--enabled","true",
+              "--format","JSON",
+              "--log-version","2",
+              "--retention","7",
+              "--output","none"
+            )
+
+            if ($ENABLE_TRAFFIC_ANALYTICS -and $LA_WORKSPACE_RESOURCE_ID) {
+              $flowLogArgs += @("--traffic-analytics","true","--workspace",$LA_WORKSPACE_RESOURCE_ID,"--interval","10")
+            }
+
+            & az @flowLogArgs 2>$null
+            $FlowLogStats.FlowLogsEnabled++
+          } catch { }
+        }
+      }
+
+      $RegionNSGs = $NSGS | Where-Object { $_.location -eq $REGION }
+      if ($RegionNSGs) {
+        foreach ($nsg in $RegionNSGs) {
+          $NSG_ID   = $nsg.id
+          $NSG_NAME = $nsg.name
+
+          try {
+            $flowLogArgs = @(
+              "network","watcher","flow-log","create",
+              "--location",$REGION,
+              "--name","flowlog-$NSG_NAME",
+              "--nsg",$NSG_ID,
+              "--storage-account",$STORAGE_ID,
+              "--enabled","true",
+              "--format","JSON",
+              "--log-version","2",
+              "--retention","7",
+              "--output","none"
+            )
+
+            if ($ENABLE_TRAFFIC_ANALYTICS -and $LA_WORKSPACE_RESOURCE_ID) {
+              $flowLogArgs += @("--traffic-analytics","true","--workspace",$LA_WORKSPACE_RESOURCE_ID,"--interval","10")
+            }
+
+            & az @flowLogArgs 2>$null
+            $FlowLogStats.FlowLogsEnabled++
+          } catch { }
+        }
+      }
+
+      Good "Flow logs configured for region: $REGION"
+    }
+  }
+
+  Good "Network Flow Logs configuration complete"
+  Info ("Storage accounts created: {0}" -f $FlowLogStats.StorageAccountsCreated)
+  Info ("Flow logs enabled:        {0}" -f $FlowLogStats.FlowLogsEnabled)
+  Info ("VNets processed:          {0}" -f $FlowLogStats.VNetsProcessed)
+  if ($ENABLE_TRAFFIC_ANALYTICS) { Good "Traffic Analytics: Enabled" }
+
+  if ($FlowLogStats.Errors.Count -gt 0) {
+    Warn "Some issues occurred:"
+    foreach ($err in $FlowLogStats.Errors) { Warn " - $err" }
+  }
+} else {
+  Warn "Flow Logs skipped"
+}
+
+# =====================================================================
+# Step 9: Sentinel Log Analytics Workspace (Optional)
+# =====================================================================
+Info ""
+Info "Step 9: Sentinel Log Analytics Workspace (Optional)"
+Info "Enter your Sentinel Log Analytics Workspace ID (blank to skip):"
+$SENTINEL_WORKSPACE_ID = Read-Host ">"
+
+if (-not [string]::IsNullOrWhiteSpace($SENTINEL_WORKSPACE_ID) -and $SUBSCRIPTIONS -and $SUBSCRIPTIONS.Count -gt 0) {
+  Info "Validating workspace and granting access..."
+
+  $WORKSPACE_FOUND        = $false
+  $WORKSPACE_RESOURCE_ID  = $null
+  $WORKSPACE_NAME         = $null
+
+  foreach ($subscription in $SUBSCRIPTIONS) {
+    az account set --subscription $subscription.id 2>$null
+    $workspaces = az monitor log-analytics workspace list --query "[?customerId=='$SENTINEL_WORKSPACE_ID'].{id:id, name:name, rg:resourceGroup}" -o json 2>$null | ConvertFrom-Json
+
+    if ($workspaces -and $workspaces.Count -gt 0) {
+      $WORKSPACE_RESOURCE_ID = $workspaces[0].id
+      $WORKSPACE_NAME        = $workspaces[0].name
+      $WORKSPACE_FOUND       = $true
+      Good "Found workspace: $WORKSPACE_NAME"
+      break
+    }
+  }
+
+  if ($WORKSPACE_FOUND) {
+    try {
+      az role assignment create `
+        --assignee $SP_ID `
+        --role "Log Analytics Reader" `
+        --scope $WORKSPACE_RESOURCE_ID `
+        --output none 2>$null
+      Good "Log Analytics Reader granted on workspace"
+    } catch {
+      Warn "Could not assign role; you may need to grant access manually"
+    }
+    Good "Virtual CSOC integration configured"
+  } else {
+    Warn "Workspace not found with ID: $SENTINEL_WORKSPACE_ID"
+    $SENTINEL_WORKSPACE_ID = $null
+  }
+} else {
+  Warn "Skipped Sentinel workspace configuration"
+}
+
+# =====================================================================
+# Step 10: Final Validation
+# =====================================================================
+Info ""
+Info "Step 10: Final Validation"
+$ValidationIssues = @()
+
+Info "[1/4] App Registration..."
+$AppCheck = az ad app show --id $APP_ID --query id -o tsv 2>$null
+if ($AppCheck) { Good "App Registration OK" } else {
+  Bad "App Registration not found"
+  $ValidationIssues += @{ Issue="App Registration not found"; Fix="Re-run the onboarding script or create manually in Entra ID" }
+}
+
+Info "[2/4] Service Principal..."
+$SpCheck = az ad sp show --id $APP_ID --query id -o tsv 2>$null
+if ($SpCheck) { Good "Service Principal OK" } else {
+  Bad "Service Principal not found"
+  $ValidationIssues += @{ Issue="Service Principal not found"; Fix="Run: az ad sp create --id $APP_ID" }
+}
+
+Info "[3/4] Graph API Consent..."
+$clientSpId = az ad sp show --id $APP_ID --query id -o tsv --only-show-errors 2>$null
+$graphSpId  = az ad sp show --id $MS_GRAPH_ID --query id -o tsv --only-show-errors 2>$null
+
+if (-not $clientSpId -or -not $graphSpId) {
+  Warn "Could not resolve service principal IDs to validate Graph consent."
+  $ValidationIssues += @{ Issue="Could not resolve SP IDs for validation"; Fix="Ensure the app/SP exist and you are signed in with sufficient directory permissions" }
+} else {
+  $assignedRoleIds = @(
+    az rest --method GET `
+      --uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignments?`$filter=resourceId eq {1}&`$select=appRoleId" -f $clientSpId,$graphSpId) `
+      --query "value[].appRoleId" -o tsv --only-show-errors 2>$null
+  ) | Where-Object { $_ } | ForEach-Object { $_.ToString().ToLower() } | Select-Object -Unique
+
+  $missing = @($GRAPH_APP_ROLE_IDS | Where-Object { $assignedRoleIds -notcontains $_ })
+
+  if ($missing.Count -eq 0 -and $GRAPH_APP_ROLE_IDS.Count -gt 0) {
+    Good ("Graph application permissions consented (all {0} required roles present)" -f $GRAPH_APP_ROLE_IDS.Count)
+  } elseif ($assignedRoleIds.Count -gt 0) {
+    Warn ("Partial Graph consent (missing {0} of {1})" -f $missing.Count, $GRAPH_APP_ROLE_IDS.Count)
+    $ValidationIssues += @{
+      Issue = "Missing Graph admin consent for required application permissions (missing $($missing.Count) role(s))"
+      Fix   = "A Global Administrator must grant consent in Entra ID for the appId $APP_ID"
+    }
+  } else {
+    Warn "No Graph appRoleAssignments detected (admin consent may not have been applied)."
+    $ValidationIssues += @{
+      Issue = "Graph API application permissions have NOT been admin-consented"
+      Fix   = "A Global Administrator must grant admin consent for the appId $APP_ID"
+    }
+  }
+}
+
+Info "[4/4] Azure RBAC Roles (spot-check Reader on first subscription)..."
+if ($SUBSCRIPTIONS -and $SUBSCRIPTIONS.Count -gt 0) {
+  $FirstSub = $SUBSCRIPTIONS | Select-Object -First 1
+  az account set --subscription $FirstSub.id 2>$null
+  $ReaderAssignment = az role assignment list `
+    --assignee $SP_ID `
+    --scope "/subscriptions/$($FirstSub.id)" `
+    --role "Reader" `
+    --query "[].id" -o tsv 2>$null
+
+  if ($ReaderAssignment) {
+    Good "RBAC verified (Reader) on: $($FirstSub.name)"
+  } else {
+    Warn "Could not verify RBAC role assignments on: $($FirstSub.name)"
+    $ValidationIssues += @{
+      Issue = "Could not verify RBAC role assignments"
+      Fix   = "Ensure you have Owner or User Access Administrator on subscriptions, or assign roles manually"
+    }
+  }
+} else {
+  Warn "No subscriptions available to validate RBAC."
+}
+
+if ($ValidationIssues.Count -gt 0) {
+  Warn "$($ValidationIssues.Count) issue(s) require attention:"
+  $i = 1
+  foreach ($issue in $ValidationIssues) {
+    Bad  ("Issue {0}: {1}" -f $i, $issue.Issue)
+    Good ("Fix    {0}: {1}" -f $i, $issue.Fix)
+    $i++
+  }
+} else {
+  Good "All validations passed"
+}
+
+# =====================================================================
+# Step 11: Auto-Provision Dashboard (Optional)
+# =====================================================================
+Info ""
+Info "Step 11: Provision Dashboard (Optional)"
+
+$AutoProvision = $true
+$DashboardUrl  = $null
+
+Info "Auto-provision dashboard now? (Y/N)"
+Warn "If you continue, this script will securely SEND your onboarding details to DUN Security over HTTPS to auto-provision the dashboard."
+Warn "Data sent includes: Tenant ID, Client ID (appId), Client Secret, Organization Name, and Subscription ID(s)."
+Warn "Do NOT continue if you are not comfortable sending these details automatically."
+Info "Proceed with secure auto-provisioning to DUN Security? (Y/n)"
+$ProvisionChoice = Read-Host ">"
+
+if ($ProvisionChoice -eq "" -or $ProvisionChoice -match "^[Yy]") {
+  Info "Provisioning your dashboard..."
+
+  $SubIds = @()
+  if ($SUBSCRIPTIONS) { $SubIds = @($SUBSCRIPTIONS | ForEach-Object { $_.id }) }
+
+  $ProvisionBody = @{
+    tenantId         = $TENANT_ID
+    clientId         = $APP_ID
+    clientSecret     = $CLIENT_SECRET
+    authMethod       = "federated"
+    organizationName = $ORG_NAME
+    subscriptionIds  = $SubIds
+  } | ConvertTo-Json -Compress
+
+  $ProvisionUrl = "https://dunsecurity.ai/api/provision/credentials"
+
+  try {
+    $ProvisionResponse = Invoke-RestMethod -Uri $ProvisionUrl -Method POST -Body $ProvisionBody -ContentType "application/json" -ErrorAction Stop
+
+    if ($ProvisionResponse.success) {
+      Good "Dashboard provisioned successfully"
+      $DashboardUrl = $ProvisionResponse.dashboardUrl
+      Info "Dashboard URL: $DashboardUrl"
+
+      if ($ProvisionResponse.validationDetails.servicePrincipalCount) {
+        Info "Validated service principals found: $($ProvisionResponse.validationDetails.servicePrincipalCount)"
+      }
+    } else {
+      Warn "Auto-provisioning failed: $($ProvisionResponse.error)"
+      $AutoProvision = $false
+    }
+  } catch {
+    Warn "Could not reach provisioning service"
+    Warn ("Error: " + $_.Exception.Message)
+    $AutoProvision = $false
+  }
+} else {
+  Warn "Skipping auto-provisioning"
+  $AutoProvision = $false
+}
+
+# =====================================================================
+# Final Output
+# =====================================================================
+Info ""
+Good "Onboarding complete"
+
+if ($DashboardUrl) {
+  Good "Your dashboard is ready"
+  Info "Dashboard URL: $DashboardUrl"
+} else {
+  Warn "As the Dashboard has not been auto provisioned you will need to provide the details manually."
+  Warn "Do NOT paste Client Secret directly into email or chat. Send it securly as suggested"
+  Info ""
+
+Info "Configuration Summary (needed by DUN support):"
+Info "Organization Name:      $ORG_NAME"
+Info "Tenant Name:            $TENANT_NAME"
+Info "Tenant ID:              $TENANT_ID"
+Info "Client ID (appId):      $APP_ID"
+Info "Client Secret:          $CLIENT_SECRET"
+Info ("No. of Subscriptions:   {0}" -f $SUB_COUNT)
+
+# ---- Subscription list (IDs + names), supports 0/1/many
+$subList = @()
+if ($SUBSCRIPTIONS) {
+  $subList = @($SUBSCRIPTIONS | ForEach-Object {
+    [pscustomobject]@{
+      Name = $_.name
+      Id   = $_.id
+    }
+  })
+}
+
+if (-not $subList -or $subList.Count -eq 0) {
+  Warn "Subscription IDs:       (none discovered in this session)"
+} elseif ($subList.Count -eq 1) {
+  Info ("Subscription ID:        {0} ({1})" -f $subList[0].Id, $subList[0].Name)
+} else {
+  # If lots of subs, print as a tidy list. If few, also print a compact CSV line.
+  $ids = @($subList | Select-Object -ExpandProperty Id)
+
+  if ($ids.Count -le 5) {
+    Info ("Subscription IDs:       {0}" -f ($ids -join ", "))
+  } else {
+    Info ("Subscription IDs:       {0} (showing list below)" -f $ids.Count)
+  }
+
+  Info "Subscriptions:"
+  foreach ($s in $subList) {
+    Info ("  - {0} ({1})" -f $s.Id, $s.Name)
+  }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($SENTINEL_WORKSPACE_ID)) {
+  Info "Sentinel Workspace ID:   $SENTINEL_WORKSPACE_ID"
+}
+
+  Info ""
+  Warn "SECURE SHARING INSTRUCTIONS (recommended): Share via OneDrive / SharePoint with an expiring link"
+  Info "1) Save Configuration Summary to a text file (example: dun-credentials.txt)"
+  Info "   Must include: Organization Name, Tenant Name, Tenant ID, Client ID (appId), Client Secret and Subscription ID(s)."
+  Info "2) Upload the file to OneDrive or a SharePoint document library."
+  Info "3) Create a sharing link:"
+  Info "   - Right-click the file -> Share"
+  Info "   - Click 'Link settings' and set:"
+  Info "       * Expiration: 24-48 hours"
+  Info "       * Optional: Require password (recommended)"
+  Info "4) Email ONLY the sharing link (and password if used) to: hi@dunsecurity.ai"
+  Info "5) After confirmation of receipt:"
+  Info "   - Delete the file"
+  Info "   - Revoke the sharing link / stop sharing"
+  Info "   DUN will store the credentials securely in your dedicated Key Vault."
+
+  Info ""
+  Info "Why this is secure:"
+  Info " - The secret is not sent in email."
+  Info " - The link can expire automatically and you control access."
+  Info " - You can revoke access at any time."
+}
+
+Info ""
+Info "Any questions or concerns please contact hi@dunsecurity.ai"
